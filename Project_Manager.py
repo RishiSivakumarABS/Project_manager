@@ -10,7 +10,11 @@ import streamlit as st
 
 DB_PATH = "tickets.db"
 MANAGER_NAME = "Ruben"
-DEFAULT_PIN = "1234"  # Change this! Or set st.secrets["MANAGER_PIN"] / env var MANAGER_PIN
+DEFAULT_PIN = "1234"  # Manager PIN default
+
+# New: Reviewer (you) settings
+REVIEWER_NAME = "Rishi"
+DEFAULT_REVIEWER_PIN = "3238648852"  # Change this or set env var RISHI_PIN
 
 # -----------------------------
 # DB utilities
@@ -45,6 +49,19 @@ def init_db():
         """
     )
     conn.commit()
+
+    # --- lightweight migrations for new columns ---
+    def add_col(name, ddl):
+        cols = [r[1] for r in cur.execute("PRAGMA table_info(tickets)").fetchall()]
+        if name not in cols:
+            cur.execute(f"ALTER TABLE tickets ADD COLUMN {name} {ddl}")
+            conn.commit()
+
+    add_col("estimate_hours", "REAL")            # reviewer estimate
+    add_col("estimate_notes", "TEXT")             # reviewer notes
+    add_col("triaged_by", "TEXT")                 # name/email of reviewer
+    add_col("triaged_at", "TEXT")                 # timestamp of triage
+
     return conn
 
 
@@ -62,7 +79,7 @@ IMPACT_OPTIONS = [
 DEPTS = [
     "Sales", "Engineering", "Supply Chain", "Finance", "Operations", "IT", "Marketing", "HR", "Other"
 ]
-STATUS_OPTIONS = ["Submitted", "Approved", "Denied", "On Hold", "In Progress", "Done"]
+STATUS_OPTIONS = ["Submitted", "Pending Manager Approval", "Approved", "Denied", "On Hold", "In Progress", "Done"]
 
 
 def submit_ticket(payload: dict):
@@ -118,6 +135,14 @@ def update_status(ticket_id: int, new_status: str, comment: str | None = None):
         cur.execute("UPDATE tickets SET status = ? WHERE id = ?", (new_status, ticket_id))
     conn.commit()
 
+def set_triage(ticket_id: int, hours: float | None, notes: str | None, triager: str):
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tickets SET estimate_hours = ?, estimate_notes = ?, triaged_by = ?, triaged_at = ?, status = ? WHERE id = ?",
+        (hours, notes, triager, datetime.utcnow().isoformat(), "Pending Manager Approval", ticket_id),
+    )
+    conn.commit()
+
 
 # -----------------------------
 # UI
@@ -130,7 +155,7 @@ subtitle = st.markdown("Collect, triage, and approve project requests across dep
 
 with st.sidebar:
     st.header("Navigation")
-    view = st.radio("Choose a view", ["Submit a Request", "Manager Dashboard"], index=0)
+    view = st.radio("Choose a view", ["Submit a Request", "My Triage", "Manager Dashboard"], index=0)
     st.markdown("---")
     st.caption("This is an internal MVP. Data is stored locally in SQLite (tickets.db). For prod, swap to SQL Server/SharePoint/Dataverse.")
 
@@ -154,7 +179,7 @@ if view == "Submit a Request":
 
         attachments = st.text_input("Links (Figma, Excel, specs, tickets)")
 
-        submitted = st.form_submit_button("Submit to Manager ➜", use_container_width=True)
+        submitted = st.form_submit_button("Submit to Rishi ➜", use_container_width=True)
 
         if submitted:
             # Validation
@@ -174,8 +199,48 @@ if view == "Submit a Request":
                     "attachments": attachments.strip() if attachments else None,
                 }
                 submit_ticket(payload)
-                st.success("Request submitted! " + f"{MANAGER_NAME} has been notified.")
+                st.success("Request submitted! Rishi has been notified.")
                 st.info("You’ll receive an update once it’s reviewed.")
+
+elif view == "My Triage":
+    st.subheader("My Triage (Add Estimates & Forward)")
+
+    # Reviewer PIN auth
+    rishi_pin_source = os.getenv("RISHI_PIN") or DEFAULT_REVIEWER_PIN
+    try:
+        _ = st.secrets
+        rishi_pin_source = st.secrets.get("RISHI_PIN", rishi_pin_source)
+    except Exception:
+        pass
+
+    with st.expander("Sign in (Reviewer PIN)", expanded=True):
+        rpin = st.text_input("Enter reviewer PIN", type="password")
+        rok = st.button("Unlock (Reviewer)")
+
+    if rok:
+        if rpin != rishi_pin_source:
+            st.error("Invalid PIN. Please try again.")
+            st.stop()
+        st.success(f"Welcome, {REVIEWER_NAME}!")
+
+    if not (rok and rpin == rishi_pin_source):
+        st.stop()
+
+    # Show only newly submitted items
+    rows = list_tickets(status_filter="Submitted")
+    st.caption(f"{len(rows)} request(s) awaiting triage")
+
+    for r in rows:
+        with st.container(border=True):
+            st.markdown(f"**#{r['id']} — {r['project_name']}**  ·  {r['department']}")
+            st.write(r["description"])  # details
+            c1, c2 = st.columns([2,2])
+            est_hours = c1.number_input(f"Estimated effort (hours) for #{r['id']}", min_value=0.0, step=0.5, key=f"eh_{r['id']}")
+            est_notes = c2.text_input(f"Notes (#{r['id']})", key=f"en_{r['id']}")
+            if st.button("Send to Manager for Approval", key=f"to_mgr_{r['id']}"):
+                set_triage(r["id"], est_hours, est_notes, REVIEWER_NAME)
+                st.success(f"Ticket #{r['id']} forwarded to {MANAGER_NAME}.")
+                st.experimental_rerun()
 
 else:
     st.subheader("Manager Dashboard")
@@ -204,7 +269,9 @@ else:
 
     # Filters
     f1, f2, f3 = st.columns([2, 2, 2])
-    status_filter = f1.selectbox("Status", ["(all)"] + STATUS_OPTIONS, index=0)
+    # Default to items waiting for manager approval
+    default_idx = (["(all)"] + STATUS_OPTIONS).index("Pending Manager Approval") if "Pending Manager Approval" in STATUS_OPTIONS else 0
+    status_filter = f1.selectbox("Status", ["(all)"] + STATUS_OPTIONS, index=default_idx)
     dept_filter = f2.selectbox("Department", ["(all)"] + DEPTS, index=0)
     search = f3.text_input("Search (name, description, requester, email)")
 
@@ -227,6 +294,10 @@ else:
                 st.markdown(f"Due: **{r['due_date'] or '—'}**")
 
             st.write(r["description"])  # long text
+
+            # Show reviewer estimate if available
+            if r.get("estimate_hours") is not None or r.get("estimate_notes"):
+                st.info(f"Reviewer estimate: {r.get('estimate_hours') or '—'} h  •  Notes: {r.get('estimate_notes') or '—'}  •  By: {r.get('triaged_by') or '—'}")
 
             meta1, meta2, meta3 = st.columns([3, 3, 6])
             meta1.caption(f"Requester: {r['requester_name']}")
