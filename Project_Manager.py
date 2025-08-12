@@ -1,6 +1,7 @@
 # ABS Project Intake Portal (Streamlit MVP)
 # Author: ChatGPT for Rishikesh (ABS)
 # Run with: streamlit run app.py
+# Requirements: streamlit>=1.26
 
 import os
 import sqlite3
@@ -10,11 +11,11 @@ import streamlit as st
 
 DB_PATH = "tickets.db"
 MANAGER_NAME = "Ruben"
-DEFAULT_PIN = "1234"  # Manager PIN default
+DEFAULT_PIN = "1234"  # Change this or set env var MANAGER_PIN / secrets.toml
 
-# New: Reviewer (you) settings
+# Reviewer (you)
 REVIEWER_NAME = "Rishi"
-DEFAULT_REVIEWER_PIN = "2468"  # Change this or set env var RISHI_PIN
+DEFAULT_REVIEWER_PIN = "2468"  # Change this or set env var RISHI_PIN / secrets.toml
 
 # -----------------------------
 # DB utilities
@@ -59,8 +60,8 @@ def init_db():
 
     add_col("estimate_hours", "REAL")            # reviewer estimate
     add_col("estimate_notes", "TEXT")             # reviewer notes
-    add_col("triaged_by", "TEXT")                 # name/email of reviewer
-    add_col("triaged_at", "TEXT")                 # timestamp of triage
+    add_col("triaged_by", "TEXT")                 # who triaged
+    add_col("triaged_at", "TEXT")                 # when triaged
 
     return conn
 
@@ -79,7 +80,11 @@ IMPACT_OPTIONS = [
 DEPTS = [
     "Sales", "Engineering", "Supply Chain", "Finance", "Operations", "IT", "Marketing", "HR", "Other"
 ]
-STATUS_OPTIONS = ["Submitted", "Pending Manager Approval", "Approved", "Denied", "On Hold", "In Progress", "Done"]
+STATUS_OPTIONS = [
+    "Submitted",
+    "Pending Manager Approval",
+    "Approved", "Denied", "On Hold", "In Progress", "Done"
+]
 
 
 def submit_ticket(payload: dict):
@@ -121,7 +126,11 @@ def list_tickets(status_filter=None, dept_filter=None, search=None):
         q += " AND (project_name LIKE ? OR description LIKE ? OR requester_name LIKE ? OR requester_email LIKE ?)"
         like = f"%{search}%"
         params.extend([like, like, like, like])
-    q += " ORDER BY CASE priority WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 WHEN 'Low' THEN 4 ELSE 5 END, datetime(created_at) ASC"
+    q += (
+        " ORDER BY CASE priority "
+        "WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 WHEN 'Low' THEN 4 ELSE 5 END, "
+        "datetime(created_at) ASC"
+    )
     cur = conn.cursor()
     rows = cur.execute(q, params).fetchall()
     return rows
@@ -135,6 +144,7 @@ def update_status(ticket_id: int, new_status: str, comment: str | None = None):
         cur.execute("UPDATE tickets SET status = ? WHERE id = ?", (new_status, ticket_id))
     conn.commit()
 
+
 def set_triage(ticket_id: int, hours: float | None, notes: str | None, triager: str):
     cur = conn.cursor()
     cur.execute(
@@ -143,7 +153,6 @@ def set_triage(ticket_id: int, hours: float | None, notes: str | None, triager: 
     )
     conn.commit()
 
-
 # -----------------------------
 # UI
 # -----------------------------
@@ -151,7 +160,7 @@ def set_triage(ticket_id: int, hours: float | None, notes: str | None, triager: 
 st.set_page_config(page_title="ABS Project Intake", page_icon="🧭", layout="wide")
 
 st.title("🧭 ABS Project Intake Portal")
-subtitle = st.markdown("Collect, triage, and approve project requests across departments.")
+_ = st.markdown("Collect, triage, and approve project requests across departments.")
 
 with st.sidebar:
     st.header("Navigation")
@@ -182,7 +191,6 @@ if view == "Submit a Request":
         submitted = st.form_submit_button("Submit to Rishi ➜", use_container_width=True)
 
         if submitted:
-            # Validation
             required = [project_name, requester_name, requester_email, description]
             if any(not x for x in required):
                 st.error("Please fill all required fields marked with *.")
@@ -205,15 +213,14 @@ if view == "Submit a Request":
 elif view == "My Triage":
     st.subheader("My Triage (Add Estimates & Forward)")
 
-    # Reviewer PIN auth
+    # Reviewer PIN auth with session persistence
     rishi_pin_source = os.getenv("RISHI_PIN") or DEFAULT_REVIEWER_PIN
     try:
-        _ = st.secrets
+        _ = st.secrets  # may raise if no secrets file
         rishi_pin_source = st.secrets.get("RISHI_PIN", rishi_pin_source)
     except Exception:
         pass
 
-    # Persist reviewer auth across reruns
     if "reviewer_unlocked" not in st.session_state:
         st.session_state["reviewer_unlocked"] = False
 
@@ -223,42 +230,39 @@ elif view == "My Triage":
             if rpin == rishi_pin_source:
                 st.session_state["reviewer_unlocked"] = True
                 st.success(f"Welcome, {REVIEWER_NAME}!")
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Invalid PIN. Please try again.")
 
     if not st.session_state["reviewer_unlocked"]:
         st.stop()
 
-    # Show only newly submitted items
     rows = list_tickets(status_filter="Submitted")
     st.caption(f"{len(rows)} request(s) awaiting triage")
 
     for r in rows:
         with st.container(border=True):
-            st.markdown(f"**#{r['id']} — {r['project_name']}**  ·  {r['department']}")
+            st.markdown(f"**#{r['id']} — {r['project_name']}** · {r['department']}")
             st.write(r["description"])  # details
-            c1, c2 = st.columns([2,2])
+            c1, c2 = st.columns([2, 2])
             est_hours = c1.number_input(f"Estimated effort (hours) for #{r['id']}", min_value=0.0, step=0.5, key=f"eh_{r['id']}")
             est_notes = c2.text_input(f"Notes (#{r['id']})", key=f"en_{r['id']}")
             if st.button("Send to Manager for Approval", key=f"to_mgr_{r['id']}"):
                 set_triage(r["id"], est_hours, est_notes, REVIEWER_NAME)
                 st.success(f"Ticket #{r['id']} forwarded to {MANAGER_NAME}.")
-                st.experimental_rerun()
+                st.rerun()
 
 else:
     st.subheader("Manager Dashboard")
 
     # Simple auth (PIN). Replace with SSO in production.
-    # Safer PIN source resolution (works even if secrets.toml doesn't exist)
     pin_source = os.getenv("MANAGER_PIN") or DEFAULT_PIN
     try:
-        _ = st.secrets  # Accessing this raises if no secrets.toml; we catch below
+        _ = st.secrets
         pin_source = st.secrets.get("MANAGER_PIN", pin_source)
     except Exception:
         pass
 
-    # Persist manager auth across reruns
     if "manager_unlocked" not in st.session_state:
         st.session_state["manager_unlocked"] = False
 
@@ -268,7 +272,7 @@ else:
             if pin == pin_source:
                 st.session_state["manager_unlocked"] = True
                 st.success(f"Welcome, {MANAGER_NAME}!")
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Invalid PIN. Please try again.")
 
@@ -277,7 +281,6 @@ else:
 
     # Filters
     f1, f2, f3 = st.columns([2, 2, 2])
-    # Default to items waiting for manager approval
     default_idx = (["(all)"] + STATUS_OPTIONS).index("Pending Manager Approval") if "Pending Manager Approval" in STATUS_OPTIONS else 0
     status_filter = f1.selectbox("Status", ["(all)"] + STATUS_OPTIONS, index=default_idx)
     dept_filter = f2.selectbox("Department", ["(all)"] + DEPTS, index=0)
@@ -287,7 +290,6 @@ else:
 
     st.caption(f"{len(rows)} request(s) shown")
 
-    # Table-like cards
     for r in rows:
         with st.container(border=True):
             top = st.columns([6, 2, 2, 2])
@@ -303,16 +305,22 @@ else:
 
             st.write(r["description"])  # long text
 
-            # Show reviewer estimate if available
-            if r.get("estimate_hours") is not None or r.get("estimate_notes"):
-                st.info(f"Reviewer estimate: {r.get('estimate_hours') or '—'} h  •  Notes: {r.get('estimate_notes') or '—'}  •  By: {r.get('triaged_by') or '—'}")
+            # Show reviewer estimate if available (sqlite Row-safe)
+            row_keys = r.keys() if hasattr(r, "keys") else []
+            eh = r["estimate_hours"] if "estimate_hours" in row_keys else None
+            en = r["estimate_notes"] if "estimate_notes" in row_keys else None
+            tb = r["triaged_by"] if "triaged_by" in row_keys else None
+            if eh is not None or (en and len(str(en)) > 0):
+                st.info(
+                    f"Reviewer estimate: {eh if eh is not None else '—'} h  •  "
+                    f"Notes: {en or '—'}  •  By: {tb or '—'}"
+                )
 
             meta1, meta2, meta3 = st.columns([3, 3, 6])
             meta1.caption(f"Requester: {r['requester_name']}")
             meta2.caption(f"Email: {r['requester_email']}")
             meta3.caption(f"Links: {r['attachments'] or '—'}")
 
-            # Action row
             cA, cB, cC, cD = st.columns([2, 2, 2, 6])
             with cD:
                 mgr_comment = st.text_input(
@@ -324,22 +332,21 @@ else:
                 if st.button("Approve", key=f"ap_{r['id']}"):
                     update_status(r["id"], "Approved", st.session_state.get(f"mc_{r['id']}") or None)
                     st.success(f"Ticket #{r['id']} approved.")
-                    st.experimental_rerun()
+                    st.rerun()
             with cB:
                 if st.button("Deny", key=f"dn_{r['id']}"):
                     update_status(r["id"], "Denied", st.session_state.get(f"mc_{r['id']}") or None)
                     st.warning(f"Ticket #{r['id']} denied.")
-                    st.experimental_rerun()
+                    st.rerun()
             with cC:
                 if st.button("On Hold", key=f"oh_{r['id']}"):
                     update_status(r["id"], "On Hold", st.session_state.get(f"mc_{r['id']}") or None)
                     st.info(f"Ticket #{r['id']} on hold.")
-                    st.experimental_rerun()
+                    st.rerun()
 
     st.markdown("---")
     st.caption("Export")
     if st.button("Download CSV of all tickets"):
-        # Simple CSV export
         import pandas as pd
         df = pd.read_sql_query("SELECT * FROM tickets ORDER BY id DESC", conn)
         csv = df.to_csv(index=False).encode("utf-8")
