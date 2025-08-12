@@ -14,7 +14,7 @@ DEFAULT_PIN = "1234"  # Manager PIN default
 
 # New: Reviewer (you) settings
 REVIEWER_NAME = "Rishi"
-DEFAULT_REVIEWER_PIN = "3238648852"  # Change this or set env var RISHI_PIN
+DEFAULT_REVIEWER_PIN = "2468"  # Change this or set env var RISHI_PIN
 
 # -----------------------------
 # DB utilities
@@ -213,17 +213,21 @@ elif view == "My Triage":
     except Exception:
         pass
 
-    with st.expander("Sign in (Reviewer PIN)", expanded=True):
-        rpin = st.text_input("Enter reviewer PIN", type="password")
-        rok = st.button("Unlock (Reviewer)")
+    # Persist reviewer auth across reruns
+    if "reviewer_unlocked" not in st.session_state:
+        st.session_state["reviewer_unlocked"] = False
 
-    if rok:
-        if rpin != rishi_pin_source:
-            st.error("Invalid PIN. Please try again.")
-            st.stop()
-        st.success(f"Welcome, {REVIEWER_NAME}!")
+    with st.expander("Sign in (Reviewer PIN)", expanded=not st.session_state["reviewer_unlocked"]):
+        rpin = st.text_input("Enter reviewer PIN", type="password", key="reviewer_pin")
+        if st.button("Unlock (Reviewer)"):
+            if rpin == rishi_pin_source:
+                st.session_state["reviewer_unlocked"] = True
+                st.success(f"Welcome, {REVIEWER_NAME}!")
+                st.experimental_rerun()
+            else:
+                st.error("Invalid PIN. Please try again.")
 
-    if not (rok and rpin == rishi_pin_source):
+    if not st.session_state["reviewer_unlocked"]:
         st.stop()
 
     # Show only newly submitted items
@@ -254,17 +258,21 @@ else:
     except Exception:
         pass
 
-    with st.expander("Sign in (Manager PIN)", expanded=True):
-        pin = st.text_input("Enter manager PIN", type="password")
-        ok = st.button("Unlock")
+    # Persist manager auth across reruns
+    if "manager_unlocked" not in st.session_state:
+        st.session_state["manager_unlocked"] = False
 
-    if ok:
-        if pin != pin_source:
-            st.error("Invalid PIN. Please try again.")
-            st.stop()
-        st.success(f"Welcome, {MANAGER_NAME}!")
+    with st.expander("Sign in (Manager PIN)", expanded=not st.session_state["manager_unlocked"]):
+        pin = st.text_input("Enter manager PIN", type="password", key="manager_pin")
+        if st.button("Unlock", key="unlock_manager"):
+            if pin == pin_source:
+                st.session_state["manager_unlocked"] = True
+                st.success(f"Welcome, {MANAGER_NAME}!")
+                st.experimental_rerun()
+            else:
+                st.error("Invalid PIN. Please try again.")
 
-    if not (ok and pin == pin_source):
+    if not st.session_state["manager_unlocked"]:
         st.stop()
 
     # Filters
