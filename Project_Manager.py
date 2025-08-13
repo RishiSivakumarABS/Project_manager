@@ -62,6 +62,9 @@ def init_db():
     add_col("estimate_notes", "TEXT")             # reviewer notes
     add_col("triaged_by", "TEXT")                 # who triaged
     add_col("triaged_at", "TEXT")                 # when triaged
+    add_col("progress", "REAL DEFAULT 0")         # 0-100 percent
+    add_col("started_at", "TEXT")                 # when work began
+    add_col("completed_at", "TEXT")               # when finished
 
     return conn
 
@@ -153,6 +156,44 @@ def set_triage(ticket_id: int, hours: float | None, notes: str | None, triager: 
     )
     conn.commit()
 
+
+def set_progress(ticket_id: int, progress: float, mark_done: bool = False):
+    progress = max(0.0, min(100.0, float(progress)))
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    if mark_done:
+        cur.execute(
+            "UPDATE tickets SET progress = 100, status = 'Done', completed_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+    else:
+        cur.execute(
+            "UPDATE tickets SET progress = ?, status = CASE WHEN status = 'Done' THEN status ELSE 'In Progress' END, started_at = COALESCE(started_at, ?) WHERE id = ?",
+            (progress, now, ticket_id),
+        )
+    conn.commit()
+
+
+def add_manual_project(project_name: str, department: str, description: str, priority: str = "Medium"):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO tickets (
+            created_at, project_name, department, requester_name, requester_email,
+            description, priority, impact, due_date, attachments, status, progress, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.utcnow().isoformat(),
+            project_name, department,
+            REVIEWER_NAME, None,
+            description, priority,
+            None, None, None,
+            "In Progress", 0, datetime.utcnow().isoformat()
+        ),
+    )
+    conn.commit()
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -164,7 +205,7 @@ _ = st.markdown("Collect, triage, and approve project requests across department
 
 with st.sidebar:
     st.header("Navigation")
-    view = st.radio("Choose a view", ["Submit a Request", "My Triage", "Manager Dashboard"], index=0)
+    view = st.radio("Choose a view", ["Submit a Request", "My Triage", "Ongoing Projects", "Manager Dashboard"], index=0)
     st.markdown("---")
     st.caption("This is an internal MVP. Data is stored locally in SQLite (tickets.db). For prod, swap to SQL Server/SharePoint/Dataverse.")
 
@@ -251,6 +292,71 @@ elif view == "My Triage":
                 set_triage(r["id"], est_hours, est_notes, REVIEWER_NAME)
                 st.success(f"Ticket #{r['id']} forwarded to {MANAGER_NAME}.")
                 st.rerun()
+
+elif view == "Ongoing Projects":
+    st.subheader("Ongoing Projects (track progress)")
+
+    # Reviewer auth (same as triage) for editing progress
+    rishi_pin_source = os.getenv("RISHI_PIN") or DEFAULT_REVIEWER_PIN
+    try:
+        _ = st.secrets
+        rishi_pin_source = st.secrets.get("RISHI_PIN", rishi_pin_source)
+    except Exception:
+        pass
+
+    if "reviewer_unlocked" not in st.session_state:
+        st.session_state["reviewer_unlocked"] = False
+
+    with st.expander("Sign in (Reviewer PIN)", expanded=not st.session_state["reviewer_unlocked"]):
+        rpin = st.text_input("Enter reviewer PIN", type="password", key="reviewer_pin2")
+        if st.button("Unlock (Reviewer)", key="unlock_review2"):
+            if rpin == rishi_pin_source:
+                st.session_state["reviewer_unlocked"] = True
+                st.success(f"Welcome, {REVIEWER_NAME}!")
+                st.rerun()
+            else:
+                st.error("Invalid PIN. Please try again.")
+
+    if not st.session_state["reviewer_unlocked"]:
+        st.stop()
+
+    # Add manual projects you are already working on
+    with st.expander("Add an existing project I’m already working on"):
+        c1, c2 = st.columns([2,1])
+        mp_name = c1.text_input("Project name")
+        mp_dept = c2.selectbox("Department", DEPTS, key="mp_dept")
+        mp_desc = st.text_area("Short description", height=100)
+        mp_priority = st.selectbox("Priority", PRIORITY_OPTIONS, index=2)
+        if st.button("Add to Ongoing"):
+            if mp_name.strip():
+                add_manual_project(mp_name.strip(), mp_dept, mp_desc.strip(), mp_priority)
+                st.success("Added to Ongoing.")
+                st.rerun()
+            else:
+                st.error("Please enter a project name.")
+
+    # Show all approved or in-progress items
+    cur_rows = list_tickets()
+    ongoing = [r for r in cur_rows if r["status"] in ("Approved", "In Progress")]
+    st.caption(f"{len(ongoing)} project(s) in progress/approved")
+
+    for r in ongoing:
+        with st.container(border=True):
+            left, right = st.columns([3, 1])
+            with left:
+                st.markdown(f"**#{r['id']} — {r['project_name']}** · {r['department']}")
+                st.caption(f"Priority: {r['priority']} • Started: {r['started_at'] or '—'} • Est: {r['estimate_hours'] or '—'} h")
+                st.write(r['description'])
+            with right:
+                prog = st.slider(f"Progress #{r['id']}", 0, 100, int(r['progress'] or 0), step=5, key=f"pg_{r['id']}")
+                if st.button("Save", key=f"save_{r['id']}"):
+                    set_progress(r['id'], prog)
+                    st.success("Progress saved")
+                    st.rerun()
+                if st.button("Mark Done", key=f"done_{r['id']}"):
+                    set_progress(r['id'], 100, mark_done=True)
+                    st.success("Marked as Done")
+                    st.rerun()
 
 else:
     st.subheader("Manager Dashboard")
