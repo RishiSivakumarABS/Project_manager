@@ -1,24 +1,38 @@
-# ABS Project Intake Portal (Streamlit MVP)
-# Author: ChatGPT for Rishikesh (ABS)
+# ABS Project Intake Portal (Streamlit + Supabase-ready)
 # Run with: streamlit run app.py
-# Requirements: streamlit>=1.26
+# Requirements: streamlit>=1.26, supabase>=2.4.0 (if using Supabase)
 
 import os
 import sqlite3
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
-DB_PATH = "tickets.db"
+# -----------------------------
+# Config
+# -----------------------------
+DB_PATH = "tickets.db"  # used only if Supabase is not configured
 MANAGER_NAME = "Ruben"
-DEFAULT_PIN = "1234"  # Change this or set env var MANAGER_PIN / secrets.toml
-
-# Reviewer (you)
+DEFAULT_PIN = "1234"  # set MANAGER_PIN env/secrets in prod
 REVIEWER_NAME = "Rishi"
-DEFAULT_REVIEWER_PIN = "2468"  # Change this or set env var RISHI_PIN / secrets.toml
+DEFAULT_REVIEWER_PIN = "2468"  # set RISHI_PIN env/secrets in prod
+
+# Supabase config
+SUPABASE_URL = "https://omiikftgugcybdqrmzas.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9taWlrZnRndWdjeWJkcXJtemFzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUyNjkzNDYsImV4cCI6MjA3MDg0NTM0Nn0.y2JtCBvcF80wc8DDpSMktG5cfWCqTH6pgc9cPw_kWLM"
+try:
+    # Try secrets first (safe on Streamlit Cloud), then env
+    SUPABASE_URL = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None
+    SUPABASE_KEY = st.secrets.get("SUPABASE_ANON_KEY") if hasattr(st, "secrets") else None
+except Exception:
+    pass
+SUPABASE_URL = os.getenv("SUPABASE_URL", SUPABASE_URL)
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", SUPABASE_KEY)
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
 # -----------------------------
-# DB utilities
+# Local SQLite fallback (for dev)
 # -----------------------------
 
 def get_conn():
@@ -27,7 +41,7 @@ def get_conn():
     return conn
 
 
-def init_db():
+def init_sqlite():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -51,30 +65,40 @@ def init_db():
     )
     conn.commit()
 
-    # --- lightweight migrations for new columns ---
+    # Lightweight migrations for new columns
     def add_col(name, ddl):
         cols = [r[1] for r in cur.execute("PRAGMA table_info(tickets)").fetchall()]
         if name not in cols:
             cur.execute(f"ALTER TABLE tickets ADD COLUMN {name} {ddl}")
             conn.commit()
 
-    add_col("estimate_hours", "REAL")            # reviewer estimate
-    add_col("estimate_notes", "TEXT")             # reviewer notes
-    add_col("triaged_by", "TEXT")                 # who triaged
-    add_col("triaged_at", "TEXT")                 # when triaged
-    add_col("progress", "REAL DEFAULT 0")         # 0-100 percent
-    add_col("started_at", "TEXT")                 # when work began
-    add_col("completed_at", "TEXT")               # when finished
+    add_col("estimate_hours", "REAL")
+    add_col("estimate_notes", "TEXT")
+    add_col("triaged_by", "TEXT")
+    add_col("triaged_at", "TEXT")
+    add_col("progress", "REAL DEFAULT 0")
+    add_col("started_at", "TEXT")
+    add_col("completed_at", "TEXT")
 
     return conn
 
-
-conn = init_db()
+# Initialize SQLite (still okay even if using Supabase — we just won't touch it)
+_sqlite_conn = init_sqlite()
 
 # -----------------------------
-# Helpers
+# Supabase client (optional)
 # -----------------------------
+if USE_SUPABASE:
+    try:
+        from supabase import create_client, Client  # type: ignore
+        sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        USE_SUPABASE = False
+        st.warning(f"Supabase not available, falling back to SQLite. Error: {e}")
 
+# -----------------------------
+# Shared constants
+# -----------------------------
 PRIORITY_OPTIONS = ["Critical", "High", "Medium", "Low"]
 IMPACT_OPTIONS = [
     "Revenue / Sales", "Customer-facing", "Compliance / Risk", "Operational Efficiency",
@@ -89,9 +113,24 @@ STATUS_OPTIONS = [
     "Approved", "Denied", "On Hold", "In Progress", "Done"
 ]
 
+# -----------------------------
+# Data access layer (Supabase if configured, else SQLite)
+# -----------------------------
 
-def submit_ticket(payload: dict):
-    cur = conn.cursor()
+def _priority_rank(p: str) -> int:
+    order = {"Critical": 1, "High": 2, "Medium": 3, "Low": 4}
+    return order.get(p or "", 99)
+
+
+def submit_ticket(payload: Dict[str, Any]):
+    if USE_SUPABASE:
+        data = payload.copy()
+        data["created_at"] = datetime.utcnow().isoformat()
+        data["status"] = "Submitted"
+        sb.table("tickets").insert(data).execute()
+        return
+    # SQLite
+    cur = _sqlite_conn.cursor()
     cur.execute(
         """
         INSERT INTO tickets (
@@ -113,12 +152,30 @@ def submit_ticket(payload: dict):
             "Submitted",
         ),
     )
-    conn.commit()
+    _sqlite_conn.commit()
 
 
-def list_tickets(status_filter=None, dept_filter=None, search=None):
+def list_tickets(status_filter: Optional[str] = None, dept_filter: Optional[str] = None, search: Optional[str] = None):
+    if USE_SUPABASE:
+        q = sb.table("tickets").select("*")
+        if status_filter and status_filter != "(all)":
+            q = q.eq("status", status_filter)
+        if dept_filter and dept_filter != "(all)":
+            q = q.eq("department", dept_filter)
+        if search:
+            like = f"%{search}%"
+            q = q.or_(
+                f"project_name.ilike.{like},description.ilike.{like},requester_name.ilike.{like},requester_email.ilike.{like}"
+            )
+        q = q.order("created_at", desc=False)
+        rows = q.execute().data or []
+        # priority secondary ordering client-side
+        rows.sort(key=lambda r: (_priority_rank(r.get("priority")), r.get("created_at", "")))
+        return rows
+
+    # SQLite
     q = "SELECT * FROM tickets WHERE 1=1"
-    params = []
+    params: List[Any] = []
     if status_filter and status_filter != "(all)":
         q += " AND status = ?"
         params.append(status_filter)
@@ -126,7 +183,9 @@ def list_tickets(status_filter=None, dept_filter=None, search=None):
         q += " AND department = ?"
         params.append(dept_filter)
     if search:
-        q += " AND (project_name LIKE ? OR description LIKE ? OR requester_name LIKE ? OR requester_email LIKE ?)"
+        q += (
+            " AND (project_name LIKE ? OR description LIKE ? OR requester_name LIKE ? OR requester_email LIKE ?)"
+        )
         like = f"%{search}%"
         params.extend([like, like, like, like])
     q += (
@@ -134,33 +193,61 @@ def list_tickets(status_filter=None, dept_filter=None, search=None):
         "WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 WHEN 'Low' THEN 4 ELSE 5 END, "
         "datetime(created_at) ASC"
     )
-    cur = conn.cursor()
+    cur = _sqlite_conn.cursor()
     rows = cur.execute(q, params).fetchall()
     return rows
 
 
-def update_status(ticket_id: int, new_status: str, comment: str | None = None):
-    cur = conn.cursor()
+def update_status(ticket_id: int, new_status: str, comment: Optional[str] = None):
+    if USE_SUPABASE:
+        data: Dict[str, Any] = {"status": new_status}
+        if comment is not None:
+            data["manager_comment"] = comment
+        sb.table("tickets").update(data).eq("id", ticket_id).execute()
+        return
+    cur = _sqlite_conn.cursor()
     if comment is not None:
-        cur.execute("UPDATE tickets SET status = ?, manager_comment = ? WHERE id = ?", (new_status, comment, ticket_id))
+        cur.execute(
+            "UPDATE tickets SET status = ?, manager_comment = ? WHERE id = ?",
+            (new_status, comment, ticket_id),
+        )
     else:
         cur.execute("UPDATE tickets SET status = ? WHERE id = ?", (new_status, ticket_id))
-    conn.commit()
+    _sqlite_conn.commit()
 
 
-def set_triage(ticket_id: int, hours: float | None, notes: str | None, triager: str):
-    cur = conn.cursor()
+def set_triage(ticket_id: int, hours: Optional[float], notes: Optional[str], triager: str):
+    if USE_SUPABASE:
+        sb.table("tickets").update(
+            {
+                "estimate_hours": hours,
+                "estimate_notes": notes,
+                "triaged_by": triager,
+                "triaged_at": datetime.utcnow().isoformat(),
+                "status": "Pending Manager Approval",
+            }
+        ).eq("id", ticket_id).execute()
+        return
+    cur = _sqlite_conn.cursor()
     cur.execute(
         "UPDATE tickets SET estimate_hours = ?, estimate_notes = ?, triaged_by = ?, triaged_at = ?, status = ? WHERE id = ?",
         (hours, notes, triager, datetime.utcnow().isoformat(), "Pending Manager Approval", ticket_id),
     )
-    conn.commit()
+    _sqlite_conn.commit()
 
 
 def set_progress(ticket_id: int, progress: float, mark_done: bool = False):
     progress = max(0.0, min(100.0, float(progress)))
-    cur = conn.cursor()
     now = datetime.utcnow().isoformat()
+    if USE_SUPABASE:
+        if mark_done:
+            sb.table("tickets").update({"progress": 100, "status": "Done", "completed_at": now}).eq("id", ticket_id).execute()
+        else:
+            sb.table("tickets").update(
+                {"progress": progress, "status": "In Progress", "started_at": now}
+            ).eq("id", ticket_id).execute()
+        return
+    cur = _sqlite_conn.cursor()
     if mark_done:
         cur.execute(
             "UPDATE tickets SET progress = 100, status = 'Done', completed_at = ? WHERE id = ?",
@@ -171,11 +258,30 @@ def set_progress(ticket_id: int, progress: float, mark_done: bool = False):
             "UPDATE tickets SET progress = ?, status = CASE WHEN status = 'Done' THEN status ELSE 'In Progress' END, started_at = COALESCE(started_at, ?) WHERE id = ?",
             (progress, now, ticket_id),
         )
-    conn.commit()
+    _sqlite_conn.commit()
 
 
 def add_manual_project(project_name: str, department: str, description: str, priority: str = "Medium"):
-    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    row = {
+        "created_at": now,
+        "project_name": project_name,
+        "department": department,
+        "requester_name": REVIEWER_NAME,
+        "requester_email": None,
+        "description": description,
+        "priority": priority,
+        "impact": None,
+        "due_date": None,
+        "attachments": None,
+        "status": "In Progress",
+        "progress": 0,
+        "started_at": now,
+    }
+    if USE_SUPABASE:
+        sb.table("tickets").insert(row).execute()
+        return
+    cur = _sqlite_conn.cursor()
     cur.execute(
         """
         INSERT INTO tickets (
@@ -184,15 +290,22 @@ def add_manual_project(project_name: str, department: str, description: str, pri
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            datetime.utcnow().isoformat(),
-            project_name, department,
-            REVIEWER_NAME, None,
-            description, priority,
-            None, None, None,
-            "In Progress", 0, datetime.utcnow().isoformat()
+            now,
+            project_name,
+            department,
+            REVIEWER_NAME,
+            None,
+            description,
+            priority,
+            None,
+            None,
+            None,
+            "In Progress",
+            0,
+            now,
         ),
     )
-    conn.commit()
+    _sqlite_conn.commit()
 
 # -----------------------------
 # UI
@@ -201,13 +314,18 @@ def add_manual_project(project_name: str, department: str, description: str, pri
 st.set_page_config(page_title="ABS Project Intake", page_icon="🧭", layout="wide")
 
 st.title("🧭 ABS Project Intake Portal")
-_ = st.markdown("Collect, triage, and approve project requests across departments.")
+st.markdown("Collect, triage, and approve project requests across departments.")
 
 with st.sidebar:
     st.header("Navigation")
-    view = st.radio("Choose a view", ["Submit a Request", "My Triage", "Ongoing Projects", "Manager Dashboard"], index=0)
+    view = st.radio(
+        "Choose a view",
+        ["Submit a Request", "My Triage", "Ongoing Projects", "Manager Dashboard"],
+        index=0,
+    )
     st.markdown("---")
-    st.caption("This is an internal MVP. Data is stored locally in SQLite (tickets.db). For prod, swap to SQL Server/SharePoint/Dataverse.")
+    storage_note = "Supabase (persistent)" if USE_SUPABASE else "SQLite (local, ephemeral on some hosts)"
+    st.caption(f"Storage backend: {storage_note}")
 
 if view == "Submit a Request":
     st.subheader("Submit a New Project Request")
@@ -220,7 +338,9 @@ if view == "Submit a Request":
         requester_name = c3.text_input("Your name *")
         requester_email = c4.text_input("Your email *")
 
-        description = st.text_area("Description *", height=160, placeholder="What problem are we solving? Scope, stakeholders, systems involved…")
+        description = st.text_area(
+            "Description *", height=160, placeholder="What problem are we solving? Scope, stakeholders, systems involved…"
+        )
 
         c5, c6, c7 = st.columns(3)
         priority = c5.selectbox("Priority *", PRIORITY_OPTIONS, index=2)
@@ -257,7 +377,7 @@ elif view == "My Triage":
     # Reviewer PIN auth with session persistence
     rishi_pin_source = os.getenv("RISHI_PIN") or DEFAULT_REVIEWER_PIN
     try:
-        _ = st.secrets  # may raise if no secrets file
+        _ = st.secrets
         rishi_pin_source = st.secrets.get("RISHI_PIN", rishi_pin_source)
     except Exception:
         pass
@@ -283,7 +403,7 @@ elif view == "My Triage":
 
     for r in rows:
         with st.container(border=True):
-            st.markdown(f"**#{r['id']} — {r['project_name']}** · {r['department']}")
+            st.markdown(f"**#{r['id']} — {r['project_name']}** · {r.get('department','')} ")
             st.write(r["description"])  # details
             c1, c2 = st.columns([2, 2])
             est_hours = c1.number_input(f"Estimated effort (hours) for #{r['id']}", min_value=0.0, step=0.5, key=f"eh_{r['id']}")
@@ -322,7 +442,7 @@ elif view == "Ongoing Projects":
 
     # Add manual projects you are already working on
     with st.expander("Add an existing project I’m already working on"):
-        c1, c2 = st.columns([2,1])
+        c1, c2 = st.columns([2, 1])
         mp_name = c1.text_input("Project name")
         mp_dept = c2.selectbox("Department", DEPTS, key="mp_dept")
         mp_desc = st.text_area("Short description", height=100)
@@ -337,18 +457,24 @@ elif view == "Ongoing Projects":
 
     # Show all approved or in-progress items
     cur_rows = list_tickets()
-    ongoing = [r for r in cur_rows if r["status"] in ("Approved", "In Progress")]
+    # Rows may be sqlite Row or dict; normalize using dict-style access
+    def _status(r):
+        return r["status"] if isinstance(r, dict) else r["status"]
+    ongoing = [r for r in cur_rows if (r["status"] if isinstance(r, dict) else r["status"]) in ("Approved", "In Progress")]
     st.caption(f"{len(ongoing)} project(s) in progress/approved")
 
     for r in ongoing:
         with st.container(border=True):
             left, right = st.columns([3, 1])
             with left:
-                st.markdown(f"**#{r['id']} — {r['project_name']}** · {r['department']}")
-                st.caption(f"Priority: {r['priority']} • Started: {r['started_at'] or '—'} • Est: {r['estimate_hours'] or '—'} h")
-                st.write(r['description'])
+                st.markdown(f"**#{r['id']} — {r['project_name']}** · {r.get('department','')}")
+                st.caption(
+                    f"Priority: {r.get('priority')} • Started: {r.get('started_at') or '—'} • Est: {r.get('estimate_hours') or '—'} h"
+                )
+                st.write(r.get('description', ''))
             with right:
-                prog = st.slider(f"Progress #{r['id']}", 0, 100, int(r['progress'] or 0), step=5, key=f"pg_{r['id']}")
+                current = int((r.get("progress") or 0))
+                prog = st.slider(f"Progress #{r['id']}", 0, 100, current, step=5, key=f"pg_{r['id']}")
                 if st.button("Save", key=f"save_{r['id']}"):
                     set_progress(r['id'], prog)
                     st.success("Progress saved")
@@ -401,21 +527,20 @@ else:
             top = st.columns([6, 2, 2, 2])
             with top[0]:
                 st.markdown(f"**#{r['id']} — {r['project_name']}**")
-                st.caption(f"{r['department']} • submitted {r['created_at']}")
+                st.caption(f"{r.get('department','')} • submitted {r.get('created_at','')}")
             with top[1]:
-                st.markdown(f"Priority: **{r['priority']}**")
+                st.markdown(f"Priority: **{r.get('priority')}**")
             with top[2]:
-                st.markdown(f"Status: **{r['status']}**")
+                st.markdown(f"Status: **{r.get('status')}**")
             with top[3]:
-                st.markdown(f"Due: **{r['due_date'] or '—'}**")
+                st.markdown(f"Due: **{r.get('due_date') or '—'}**")
 
-            st.write(r["description"])  # long text
+            st.write(r.get("description", ""))  # long text
 
-            # Show reviewer estimate if available (sqlite Row-safe)
-            row_keys = r.keys() if hasattr(r, "keys") else []
-            eh = r["estimate_hours"] if "estimate_hours" in row_keys else None
-            en = r["estimate_notes"] if "estimate_notes" in row_keys else None
-            tb = r["triaged_by"] if "triaged_by" in row_keys else None
+            # Show reviewer estimate if available (dict-safe)
+            eh = r.get("estimate_hours")
+            en = r.get("estimate_notes")
+            tb = r.get("triaged_by")
             if eh is not None or (en and len(str(en)) > 0):
                 st.info(
                     f"Reviewer estimate: {eh if eh is not None else '—'} h  •  "
@@ -423,15 +548,15 @@ else:
                 )
 
             meta1, meta2, meta3 = st.columns([3, 3, 6])
-            meta1.caption(f"Requester: {r['requester_name']}")
-            meta2.caption(f"Email: {r['requester_email']}")
-            meta3.caption(f"Links: {r['attachments'] or '—'}")
+            meta1.caption(f"Requester: {r.get('requester_name')}")
+            meta2.caption(f"Email: {r.get('requester_email')}")
+            meta3.caption(f"Links: {r.get('attachments') or '—'}")
 
             cA, cB, cC, cD = st.columns([2, 2, 2, 6])
             with cD:
                 mgr_comment = st.text_input(
                     f"Manager comment (#{r['id']})",
-                    value=r["manager_comment"] or "",
+                    value=r.get("manager_comment") or "",
                     key=f"mc_{r['id']}"
                 )
             with cA:
@@ -451,11 +576,13 @@ else:
                     st.rerun()
 
     st.markdown("---")
-    st.caption("Export")
-    if st.button("Download CSV of all tickets"):
+    st.caption("Export (SQLite only)")
+    if not USE_SUPABASE and st.button("Download CSV of all tickets"):
         import pandas as pd
-        df = pd.read_sql_query("SELECT * FROM tickets ORDER BY id DESC", conn)
+        df = pd.read_sql_query("SELECT * FROM tickets ORDER BY id DESC", _sqlite_conn)
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("Save tickets.csv", data=csv, file_name="tickets.csv", mime="text/csv")
 
-    st.caption("Tip: For production, integrate with Power Automate Approvals, SharePoint or Dataverse, and Azure AD for SSO.")
+    st.caption(
+        "Tip: For production, integrate with Power Automate Approvals, SharePoint/Dataverse, and Azure AD for SSO."
+    )
